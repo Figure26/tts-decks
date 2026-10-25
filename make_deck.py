@@ -5,7 +5,11 @@ CSV columns: Name, Effect, Starting count  (tab, comma or semicolon separated)
 
   make_deck.py cards/resource.csv            # render, push to GitHub, write Saved Object
   make_deck.py cards/resource.csv --no-push  # local file:// URLs, for testing alone
-  make_deck.py --watch cards/                # rebuild whenever a CSV in the folder changes
+  make_deck.py --watch cards/                # build every CSV dropped into the folder
+
+A CSV that built successfully is moved into a done/ folder next to it (--keep to
+leave it in place), so a watched folder only ever holds CSVs that still need
+building. A failed CSV stays put and is retried once it is edited.
 
 The card faces are tiled into 10x7 sheets, committed under images/ in this repo and
 referenced through raw.githubusercontent.com, so every player in a multiplayer game
@@ -358,18 +362,34 @@ def build(csv_path, out_dir, color_override, do_push):
     print(f"{csv_path.name}: {len(cards)} unique / {total} cards -> {out}")
 
 
-def watch(folder, out_dir, color, do_push):
-    seen = {}
-    print(f"Watching {folder} for CSV changes (Ctrl+C to stop)")
+def archive(csv_path):
+    if csv_path.parent.name == "done":
+        return
+    done = csv_path.parent / "done"
+    done.mkdir(exist_ok=True)
+    csv_path.replace(done / csv_path.name)   # an older copy with the same name is overwritten
+    print(f"  moved to {done / csv_path.name}")
+
+
+def watch(folder, out_dir, color, do_push, keep):
+    failed = {}   # path -> mtime of a version that failed; retried once the file changes
+    print(f"Watching {folder} for new CSVs (Ctrl+C to stop)")
     while True:
-        for p in folder.glob("*.csv"):
+        for p in sorted(folder.glob("*.csv")):
             mtime = p.stat().st_mtime
-            if seen.get(p) != mtime:
-                seen[p] = mtime
-                try:
-                    build(p, out_dir, color, do_push)
-                except (SystemExit, Exception) as e:
-                    print(f"{p.name}: failed: {e}")
+            if failed.get(p) == mtime or time.time() - mtime < 1:   # unchanged failure, or still being written
+                continue
+            try:
+                build(p, out_dir, color, do_push)
+            except (SystemExit, Exception) as e:
+                failed[p] = mtime
+                print(f"{p.name}: failed: {e}")
+                continue
+            failed.pop(p, None)
+            if keep:
+                failed[p] = mtime   # don't rebuild it every loop; an edit triggers a rebuild
+            else:
+                archive(p)
         time.sleep(2)
 
 
@@ -380,12 +400,16 @@ def main():
     ap.add_argument("--color", help=f"card border/back colour: {', '.join(PALETTE)} or #rrggbb "
                                      "(remembered per deck; asked for new decks when omitted)")
     ap.add_argument("--no-push", action="store_true", help="use local file:// URLs instead of GitHub")
-    ap.add_argument("--watch", action="store_true", help="watch a folder and rebuild changed CSVs")
+    ap.add_argument("--watch", action="store_true", help="watch a folder and build CSVs dropped into it")
+    ap.add_argument("--keep", action="store_true", help="leave built CSVs in place instead of moving them to done/")
     a = ap.parse_args()
+    sys.stdout.reconfigure(line_buffering=True)   # show progress promptly when logged to a file
     if a.watch:
-        watch(a.path, a.out, a.color, not a.no_push)
+        watch(a.path, a.out, a.color, not a.no_push, a.keep)
     else:
         build(a.path, a.out, a.color, not a.no_push)
+        if not a.keep:
+            archive(a.path)
 
 
 if __name__ == "__main__":
