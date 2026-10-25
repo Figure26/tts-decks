@@ -18,6 +18,7 @@ import hashlib
 import json
 import math
 import random
+import re
 import subprocess
 import sys
 import time
@@ -41,6 +42,15 @@ SANS_BOLD = FONT_DIR / "NotoSans-Bold.ttf"
 CREAM = (247, 241, 227)
 INK = (38, 34, 28)
 
+# Mid/dark tones so the cream text on the back stays readable
+PALETTE = {
+    "green": "#6e8b3d", "blue": "#3d6a8b", "red": "#8b3d3d", "purple": "#6a3d8b",
+    "orange": "#b8742a", "teal": "#2f7f7a", "brown": "#7a5a3a", "gold": "#a88a2a",
+    "pink": "#a3486e", "navy": "#2c3e66", "gray": "#5f6368", "black": "#2b2b2b",
+}
+DEFAULT_COLOR = "green"
+COLORS_FILE = REPO / "colors.json"   # deck name -> chosen colour, so each deck is asked only once
+
 
 def hex_rgb(s):
     s = s.lstrip("#")
@@ -51,15 +61,78 @@ def darker(rgb, f=0.55):
     return tuple(int(c * f) for c in rgb)
 
 
+def parse_color(s):
+    """Palette name, palette number (1-based) or #rrggbb; None if not recognised."""
+    s = s.strip().lower()
+    names = list(PALETTE)
+    if s in PALETTE:
+        return s
+    if s.isdigit() and 1 <= int(s) <= len(names):
+        return names[int(s) - 1]
+    hexpart = s.lstrip("#")
+    if len(hexpart) == 6 and all(c in "0123456789abcdef" for c in hexpart):
+        return "#" + hexpart
+    return None
+
+
+def ask_color(deck_name):
+    if not sys.stdin.isatty():
+        print(f"New deck '{deck_name}': no terminal to ask, using {DEFAULT_COLOR}")
+        return DEFAULT_COLOR
+    print(f"\nNew deck detected: {deck_name}")
+    for i, name in enumerate(PALETTE, start=1):
+        r, g, b = hex_rgb(PALETTE[name])
+        print(f"  {i:2}. \x1b[48;2;{r};{g};{b}m    \x1b[0m {name}")
+    while True:
+        answer = input(f"Color? (name, number or #hex, Enter = {DEFAULT_COLOR}) > ")
+        if not answer.strip():
+            return DEFAULT_COLOR
+        color = parse_color(answer)
+        if color:
+            return color
+        print(f"  '{answer}' is not a colour from the list or a #rrggbb hex code")
+
+
+def resolve_color(deck_name, override):
+    """Colour from --color, else the one remembered for this deck, else ask."""
+    saved = json.loads(COLORS_FILE.read_text()) if COLORS_FILE.exists() else {}
+    if override:
+        color = parse_color(override)
+        if not color:
+            sys.exit(f"--color: unknown colour {override!r} (use one of {', '.join(PALETTE)} or #rrggbb)")
+    elif deck_name in saved:
+        color = saved[deck_name]
+    else:
+        color = ask_color(deck_name)
+    if saved.get(deck_name) != color:
+        saved[deck_name] = color
+        COLORS_FILE.write_text(json.dumps(saved, indent=2, sort_keys=True) + "\n")
+    return hex_rgb(PALETTE.get(color, color))
+
+
 # --- CSV ---------------------------------------------------------------------
+
+STANDARD_COLUMNS = {"name", "effect", "starting count"}
+
+
+def deck_title(csv_path):
+    """'CS decks - Season deck.csv' (a Google Sheets export) -> 'Season deck'."""
+    stem = csv_path.stem.rsplit(" - ", 1)[-1]
+    title = " ".join(stem.replace("_", " ").split())
+    return title[:1].upper() + title[1:]
+
+
+def slug(text):
+    return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-") or "deck"
 
 def read_cards(path):
     text = path.read_text(encoding="utf-8-sig")
     dialect = csv.Sniffer().sniff(text.splitlines()[0], delimiters="\t,;")
     rows = list(csv.DictReader(text.splitlines(), dialect=dialect))
     cards = []
-    for i, row in enumerate(rows, start=2):
-        row = {(k or "").strip().lower(): (v or "").strip() for k, v in row.items()}
+    for i, raw in enumerate(rows, start=2):
+        raw = {(k or "").strip(): (v or "").strip() for k, v in raw.items()}
+        row = {k.lower(): v for k, v in raw.items()}
         name = row.get("name", "")
         if not name:
             continue
@@ -68,7 +141,9 @@ def read_cards(path):
             count = int(count)
         except ValueError:
             sys.exit(f"{path.name} line {i}: 'Starting count' is not a number: {count!r}")
-        cards.append({"name": name, "effect": row.get("effect", ""), "count": count})
+        # Any other column is printed on the card as "Header: value"
+        extra = [(k, v) for k, v in raw.items() if k and v and k.lower() not in STANDARD_COLUMNS]
+        cards.append({"name": name, "effect": row.get("effect", ""), "count": count, "extra": extra})
     if not cards:
         sys.exit(f"{path.name}: no cards found (expected columns Name, Effect, Starting count)")
     return cards
@@ -114,8 +189,18 @@ def render_face(card, category, color):
     d.text((cx, 98), card["name"], font=title, fill=INK, anchor="mm")
     d.line((cx - 100, 143, cx + 100, 143), fill=darker(color), width=2)
 
-    # Effect: largest size whose wrapped text fits the body area
+    # Extra columns sit at the bottom, above a thin rule
     body_top, body_bot = 165, CARD_H - m - 30
+    if card["extra"]:
+        y = CARD_H - m - 28
+        for key, value in reversed(card["extra"]):
+            d.text((cx, y), f"{key}: {value}", font=fit_font(d, f"{key}: {value}", SANS_BOLD, 20, inner, 12),
+                   fill=darker(color), anchor="mm")
+            y -= 30
+        d.line((cx - 100, y + 6, cx + 100, y + 6), fill=darker(color), width=1)
+        body_bot = y - 10
+
+    # Effect: largest size whose wrapped text fits the body area
     for size in range(42, 15, -2):
         font = ImageFont.truetype(str(SANS), size)
         lines = wrap_lines(d, card["effect"], font, inner)
@@ -198,7 +283,7 @@ def transform(y=1.0):
 def card_obj(card, card_id, custom_deck):
     return {
         "GUID": guid(), "Name": "Card", "Transform": transform(),
-        "Nickname": card["name"], "Description": card["effect"], "GMNotes": "",
+        "Nickname": card["name"], "Description": "\n".join([card["effect"]] + [f"{k}: {v}" for k, v in card["extra"]]).strip(), "GMNotes": "",
         "ColorDiffuse": {"r": 0.713235259, "g": 0.713235259, "b": 0.713235259},
         "Locked": False, "Grid": True, "Snap": True, "Autoraise": True, "Sticky": True,
         "Tooltip": True, "HideWhenFaceDown": True, "Hands": True, "SidewaysCard": False,
@@ -245,15 +330,16 @@ def build_object(deck_name, sheets_info, back_url):
 
 # --- main ----------------------------------------------------------------------
 
-def build(csv_path, out_dir, color, do_push):
-    stem = csv_path.stem
-    title = stem.replace("_", " ").replace("-", " ").strip().capitalize()
+def build(csv_path, out_dir, color_override, do_push):
+    title = deck_title(csv_path)
+    stem = slug(title)                    # image file names must be URL-safe
     cards = read_cards(csv_path)
+    color = resolve_color(title, color_override)
 
     back = save_hashed(render_back(title, color), f"{stem}-back")
     sheets = [(save_hashed(im, f"{stem}-face{n}"), cols, rows, chunk)
               for n, (im, cols, rows, chunk) in enumerate(render_sheets(cards, title, color))]
-    paths = [back] + [s[0] for s in sheets]
+    paths = [back] + [s[0] for s in sheets] + [COLORS_FILE]
 
     if do_push:
         push(paths, title)
@@ -264,9 +350,9 @@ def build(csv_path, out_dir, color, do_push):
 
     save = build_object(title, [(url(p), c, r, ch) for p, c, r, ch in sheets], url(back))
     out_dir.mkdir(parents=True, exist_ok=True)
-    out = out_dir / f"{stem}.json"
+    out = out_dir / f"{title}.json"
     out.write_text(json.dumps(save, indent=2))
-    Image.open(back).resize((256, 366)).save(out_dir / f"{stem}.png")   # Saved Objects thumbnail
+    Image.open(back).resize((256, 366)).save(out_dir / f"{title}.png")   # Saved Objects thumbnail
 
     total = sum(c["count"] for c in cards)
     print(f"{csv_path.name}: {len(cards)} unique / {total} cards -> {out}")
@@ -291,15 +377,15 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("path", type=Path, help="CSV file, or a folder with --watch")
     ap.add_argument("--out", type=Path, default=DEFAULT_OUT, help=f"Saved Objects folder (default: {DEFAULT_OUT})")
-    ap.add_argument("--color", default="#6e8b3d", help="card border/back colour (default: %(default)s)")
+    ap.add_argument("--color", help=f"card border/back colour: {', '.join(PALETTE)} or #rrggbb "
+                                     "(remembered per deck; asked for new decks when omitted)")
     ap.add_argument("--no-push", action="store_true", help="use local file:// URLs instead of GitHub")
     ap.add_argument("--watch", action="store_true", help="watch a folder and rebuild changed CSVs")
     a = ap.parse_args()
-    color = hex_rgb(a.color)
     if a.watch:
-        watch(a.path, a.out, color, not a.no_push)
+        watch(a.path, a.out, a.color, not a.no_push)
     else:
-        build(a.path, a.out, color, not a.no_push)
+        build(a.path, a.out, a.color, not a.no_push)
 
 
 if __name__ == "__main__":
